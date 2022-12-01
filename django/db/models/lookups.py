@@ -518,7 +518,7 @@ class IsNull(BuiltinLookup):
                 'deprecated, use True or False instead.',
                 RemovedInDjango40Warning,
             )
-        sql, params = compiler.compile(self.lhs)
+        sql, params = self.process_lhs(compiler, connection)
         if self.rhs:
             return "%s IS NULL" % sql, params
         else:

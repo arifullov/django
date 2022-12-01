@@ -8,6 +8,11 @@ from django.db import DEFAULT_DB_ALIAS, DatabaseError, connection, connections
 from django.db.backends.base.base import BaseDatabaseWrapper
 from django.test import TestCase, override_settings
 
+try:
+    from django.db.backends.postgresql.psycopg_any import is_psycopg3
+except ImportError:
+    is_psycopg3 = False
+
 
 @unittest.skipUnless(connection.vendor == 'postgresql', 'PostgreSQL tests')
 class Tests(TestCase):
@@ -172,28 +177,39 @@ class Tests(TestCase):
         The transaction level can be configured with
         DATABASES ['OPTIONS']['isolation_level'].
         """
-        import psycopg2
-        from psycopg2.extensions import (
-            ISOLATION_LEVEL_READ_COMMITTED as read_committed,
-            ISOLATION_LEVEL_SERIALIZABLE as serializable,
-        )
+        from django.db.backends.postgresql.psycopg_any import IsolationLevel
 
         # Since this is a django.test.TestCase, a transaction is in progress
         # and the isolation level isn't reported as 0. This test assumes that
         # PostgreSQL is configured with the default isolation level.
-        # Check the level on the psycopg2 connection, not the Django wrapper.
-        default_level = read_committed if psycopg2.__version__ < '2.7' else None
-        self.assertEqual(connection.connection.isolation_level, default_level)
+        # Check the level on the psycopg connection, not the Django wrapper.
+        self.assertIsNone(connection.connection.isolation_level)
 
         new_connection = connection.copy()
-        new_connection.settings_dict['OPTIONS']['isolation_level'] = serializable
+        new_connection.settings_dict["OPTIONS"][
+            "isolation_level"
+        ] = IsolationLevel.SERIALIZABLE
         try:
             # Start a transaction so the isolation level isn't reported as 0.
             new_connection.set_autocommit(False)
-            # Check the level on the psycopg2 connection, not the Django wrapper.
-            self.assertEqual(new_connection.connection.isolation_level, serializable)
+            # Check the level on the psycopg connection, not the Django wrapper.
+            self.assertEqual(
+                new_connection.connection.isolation_level,
+                IsolationLevel.SERIALIZABLE,
+            )
         finally:
             new_connection.close()
+
+    def test_connect_invalid_isolation_level(self):
+        self.assertIsNone(connection.connection.isolation_level)
+        new_connection = connection.copy()
+        new_connection.settings_dict["OPTIONS"]["isolation_level"] = -1
+        msg = (
+            "Invalid transaction isolation level -1 specified. Use one of the "
+            "psycopg.IsolationLevel values."
+        )
+        with self.assertRaisesMessage(ImproperlyConfigured, msg):
+            new_connection.ensure_connection()
 
     def test_connect_no_is_usable_checks(self):
         new_connection = connection.copy()
@@ -206,7 +222,7 @@ class Tests(TestCase):
 
     def _select(self, val):
         with connection.cursor() as cursor:
-            cursor.execute('SELECT %s', (val,))
+            cursor.execute("SELECT %s::text[]", (val,))
             return cursor.fetchone()[0]
 
     def test_select_ascii_array(self):
@@ -234,15 +250,19 @@ class Tests(TestCase):
                 with self.subTest(lookup=lookup, field_type=field_type):
                     self.assertIn('::citext', do.lookup_cast(lookup, internal_type=field_type))
 
-    def test_correct_extraction_psycopg2_version(self):
-        from django.db.backends.postgresql.base import psycopg2_version
-        with mock.patch('psycopg2.__version__', '4.2.1 (dt dec pq3 ext lo64)'):
-            self.assertEqual(psycopg2_version(), (4, 2, 1))
-        with mock.patch('psycopg2.__version__', '4.2b0.dev1 (dt dec pq3 ext lo64)'):
-            self.assertEqual(psycopg2_version(), (4, 2))
+    def test_correct_extraction_psycopg_version(self):
+        from django.db.backends.postgresql.base import Database, psycopg_version
+
+        with mock.patch.object(Database, "__version__", "4.2.1 (dt dec pq3 ext lo64)"):
+            self.assertEqual(psycopg_version(), (4, 2, 1))
+        with mock.patch.object(
+            Database, "__version__", "4.2b0.dev1 (dt dec pq3 ext lo64)"
+        ):
+            self.assertEqual(psycopg_version(), (4, 2))
 
     @override_settings(DEBUG=True)
-    def test_copy_cursors(self):
+    @unittest.skipIf(is_psycopg3, "psycopg2 specific test")
+    def test_copy_to_expert_cursors(self):
         out = StringIO()
         copy_expert_sql = 'COPY django_session TO STDOUT (FORMAT CSV, HEADER)'
         with connection.cursor() as cursor:
@@ -252,3 +272,13 @@ class Tests(TestCase):
             [q['sql'] for q in connection.queries],
             [copy_expert_sql, 'COPY django_session TO STDOUT'],
         )
+
+    @override_settings(DEBUG=True)
+    @unittest.skipUnless(is_psycopg3, "psycopg3 specific test")
+    def test_copy_cursors(self):
+        copy_sql = "COPY django_session TO STDOUT (FORMAT CSV, HEADER)"
+        with connection.cursor() as cursor:
+            with cursor.copy(copy_sql) as copy:
+                for row in copy:
+                    pass
+        self.assertEqual([q["sql"] for q in connection.queries], [copy_sql])

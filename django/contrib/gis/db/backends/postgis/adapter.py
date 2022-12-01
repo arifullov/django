@@ -2,10 +2,10 @@
  This object provides quoting for GEOS geometries into PostgreSQL/PostGIS.
 """
 from psycopg2 import Binary
-from psycopg2.extensions import ISQLQuote
 
 from django.contrib.gis.db.backends.postgis.pgraster import to_pgraster
 from django.contrib.gis.geos import GEOSGeometry
+from django.db.backends.postgresql.psycopg_any import sql
 
 
 class PostGISAdapter:
@@ -28,6 +28,8 @@ class PostGISAdapter:
 
     def __conform__(self, proto):
         """Does the given protocol conform to what Psycopg2 expects?"""
+        from psycopg2.extensions import ISQLQuote
+
         if proto == ISQLQuote:
             return self
         else:
@@ -60,10 +62,10 @@ class PostGISAdapter:
         """
         if self.is_geometry:
             # Psycopg will figure out whether to use E'\\000' or '\000'.
-            return '%s(%s)' % (
-                'ST_GeogFromWKB' if self.geography else 'ST_GeomFromEWKB',
-                self._adapter.getquoted().decode()
+            return b"%s(%s)" % (
+                b"ST_GeogFromWKB" if self.geography else b"ST_GeomFromEWKB",
+                sql.quote(self.ewkb).encode(),
             )
         else:
             # For rasters, add explicit type cast to WKB string.
-            return "'%s'::raster" % self.ewkb
+            return b"'%s'::raster" % self.ewkb.hex().encode()
