@@ -1,5 +1,3 @@
-import psycopg2
-
 from django.db.models import (
     CharField, Expression, Field, FloatField, Func, Lookup, TextField, Value,
 )
@@ -34,6 +32,11 @@ class SearchQueryField(Field):
 
     def db_type(self, connection):
         return 'tsquery'
+
+
+class _Float4Field(Field):
+    def db_type(self, connection):
+        return "float4"
 
 
 class SearchConfig(Expression):
@@ -118,7 +121,11 @@ class SearchVector(SearchVectorCombinable, Func):
         if clone.weight:
             weight_sql, extra_params = compiler.compile(clone.weight)
             sql = 'setweight({}, {})'.format(sql, weight_sql)
-        return sql, config_params + params + extra_params
+
+        # These parameters must be bound on the client side because we may
+        # want to create an index on this expression.
+        sql = connection.ops.compose_sql(sql, config_params + params + extra_params)
+        return sql, []
 
 
 class CombinedSearchVector(SearchVectorCombinable, CombinedExpression):
@@ -212,6 +219,8 @@ class SearchRank(Func):
         self, vector, query, weights=None, normalization=None,
         cover_density=False,
     ):
+        from .fields.array import ArrayField
+
         if not hasattr(vector, 'resolve_expression'):
             vector = SearchVector(vector)
         if not hasattr(query, 'resolve_expression'):
@@ -220,6 +229,7 @@ class SearchRank(Func):
         if weights is not None:
             if not hasattr(weights, 'resolve_expression'):
                 weights = Value(weights)
+            weights = Cast(weights, ArrayField(_Float4Field()))
             expressions = (weights,) + expressions
         if normalization is not None:
             if not hasattr(normalization, 'resolve_expression'):
@@ -266,14 +276,13 @@ class SearchHeadline(Func):
         options_sql = ''
         options_params = []
         if self.options:
-            # getquoted() returns a quoted bytestring of the adapted value.
-            options_params.append(', '.join(
-                '%s=%s' % (
-                    option,
-                    psycopg2.extensions.adapt(value).getquoted().decode(),
-                ) for option, value in self.options.items()
-            ))
-            options_sql = ', %s'
+            options_params.append(
+                ", ".join(
+                    connection.ops.compose_sql(f"{option}=%s", [value])
+                    for option, value in self.options.items()
+                )
+            )
+            options_sql = ", %s"
         sql, params = super().as_sql(
             compiler, connection, function=function, template=template,
             options=options_sql,

@@ -1,7 +1,23 @@
-from psycopg2.extras import Inet
+import json
+from functools import lru_cache, partial
 
 from django.conf import settings
 from django.db.backends.base.operations import BaseDatabaseOperations
+from django.db.backends.postgresql.psycopg_any import (
+    Inet,
+    Jsonb,
+    errors,
+    is_psycopg3,
+    mogrify,
+)
+from django.utils.regex_helper import _lazy_re_compile
+
+
+@lru_cache
+def get_json_dumps(encoder):
+    if encoder is None:
+        return json.dumps
+    return partial(json.dumps, cls=encoder)
 
 
 class DatabaseOperations(BaseDatabaseOperations):
@@ -25,6 +41,18 @@ class DatabaseOperations(BaseDatabaseOperations):
         'SmallAutoField': 'smallint',
     }
 
+    if is_psycopg3:
+        from psycopg.types import numeric
+
+        integerfield_type_map = {
+            "SmallIntegerField": numeric.Int2,
+            "IntegerField": numeric.Int4,
+            "BigIntegerField": numeric.Int8,
+            "PositiveSmallIntegerField": numeric.Int2,
+            "PositiveIntegerField": numeric.Int4,
+            "PositiveBigIntegerField": numeric.Int8,
+        }
+
     def unification_cast_sql(self, output_field):
         internal_type = output_field.get_internal_type()
         if internal_type in ("GenericIPAddressField", "IPAddressField", "TimeField", "UUIDField"):
@@ -38,17 +66,23 @@ class DatabaseOperations(BaseDatabaseOperations):
             return 'CAST(%%s AS %s)' % output_field.db_type(self.connection).split('(')[0]
         return '%s'
 
+    # EXTRACT format cannot be passed in parameters.
+    _extract_format_re = _lazy_re_compile(r"[A-Z_]+")
+
     def date_extract_sql(self, lookup_type, field_name):
         # https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-EXTRACT
         if lookup_type == 'week_day':
             # For consistency across backends, we return Sunday=1, Saturday=7.
-            return "EXTRACT('dow' FROM %s) + 1" % field_name
+            return "EXTRACT(DOW FROM %s) + 1" % field_name
         elif lookup_type == 'iso_week_day':
-            return "EXTRACT('isodow' FROM %s)" % field_name
+            return "EXTRACT(ISODOW FROM %s)" % field_name
         elif lookup_type == 'iso_year':
-            return "EXTRACT('isoyear' FROM %s)" % field_name
-        else:
-            return "EXTRACT('%s' FROM %s)" % (lookup_type, field_name)
+            return "EXTRACT(ISOYEAR FROM %s)" % field_name
+
+        lookup_type = lookup_type.upper()
+        if not self._extract_format_re.fullmatch(lookup_type):
+            raise ValueError(f"Invalid lookup type: {lookup_type!r}")
+        return f"EXTRACT({lookup_type} FROM {field_name})"
 
     def date_trunc_sql(self, lookup_type, field_name, tzname=None):
         field_name = self._convert_field_to_tz(field_name, tzname)
@@ -101,6 +135,16 @@ class DatabaseOperations(BaseDatabaseOperations):
     def lookup_cast(self, lookup_type, internal_type=None):
         lookup = '%s'
 
+        if lookup_type == "isnull" and internal_type in (
+            "CharField",
+            "EmailField",
+            "TextField",
+            "CICharField",
+            "CIEmailField",
+            "CITextField",
+        ):
+            return "%s::text"
+
         # Cast text lookups to text to allow things like filter(x__contains=4)
         if lookup_type in ('iexact', 'contains', 'icontains', 'startswith',
                            'istartswith', 'endswith', 'iendswith', 'regex', 'iregex'):
@@ -128,8 +172,11 @@ class DatabaseOperations(BaseDatabaseOperations):
             return name  # Quoting once is enough.
         return '"%s"' % name
 
+    def compose_sql(self, sql, params):
+        return mogrify(sql, params, self.connection)
+
     def set_time_zone_sql(self):
-        return "SET TIME ZONE %s"
+        return "SELECT set_config('TimeZone', %s, false)"
 
     def sql_flush(self, style, tables, *, reset_sequences=False, allow_cascade=False):
         if not tables:
@@ -221,12 +268,22 @@ class DatabaseOperations(BaseDatabaseOperations):
         else:
             return ['DISTINCT'], []
 
-    def last_executed_query(self, cursor, sql, params):
-        # https://www.psycopg.org/docs/cursor.html#cursor.query
-        # The query attribute is a Psycopg extension to the DB API 2.0.
-        if cursor.query is not None:
-            return cursor.query.decode()
-        return None
+    if is_psycopg3:
+
+        def last_executed_query(self, cursor, sql, params):
+            try:
+                return self.compose_sql(sql, params)
+            except errors.DataError:
+                return None
+
+    else:
+
+        def last_executed_query(self, cursor, sql, params):
+            # https://www.psycopg.org/docs/cursor.html#cursor.query
+            # The query attribute is a Psycopg extension to the DB API 2.0.
+            if cursor.query is not None:
+                return cursor.query.decode()
+            return None
 
     def return_insert_columns(self, fields):
         if not fields:
@@ -244,6 +301,13 @@ class DatabaseOperations(BaseDatabaseOperations):
         values_sql = ", ".join("(%s)" % sql for sql in placeholder_rows_sql)
         return "VALUES " + values_sql
 
+    if is_psycopg3:
+
+        def adapt_integerfield_value(self, value, internal_type):
+            if value is None or hasattr(value, "resolve_expression"):
+                return value
+            return self.integerfield_type_map[internal_type](value)
+
     def adapt_datefield_value(self, value):
         return value
 
@@ -260,6 +324,9 @@ class DatabaseOperations(BaseDatabaseOperations):
         if value:
             return Inet(value)
         return None
+
+    def adapt_json_value(self, value, encoder):
+        return Jsonb(value, dumps=get_json_dumps(encoder))
 
     def subtract_temporals(self, internal_type, lhs, rhs):
         if internal_type == 'DateField':
